@@ -25,7 +25,7 @@ jobs:
       - name: Mirror website to local folder
         run: |
           set -e
-          SITE="https://playgta5.com"          # <-- এখানে আপনার সাইটের লিংক বসান
+          SITE="https://playgat5.com"          # <-- আপনার সাইটের লিংক
           rm -rf webroot
           mkdir -p webroot
 
@@ -38,7 +38,7 @@ jobs:
             -F "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
             || true
 
-          # httrack সবসময় domain নামে সাব-ফোল্ডার বানায় → ফ্ল্যাট করি
+          # httrack domain নামে সাব-ফোল্ডার বানায় → ফ্ল্যাট করি
           DOMAIN_DIR=$(find webroot -maxdepth 1 -mindepth 1 -type d | head -n 1)
           if [ -n "$DOMAIN_DIR" ]; then
             shopt -s dotglob
@@ -47,7 +47,7 @@ jobs:
             rmdir "$DOMAIN_DIR" 2>/dev/null || true
           fi
 
-          # index.html রুটে না থাকলে খুঁজে এনে রুটে আনি
+          # index.html খুঁজে রুটে আনি
           if [ ! -f webroot/index.html ]; then
             FOUND=$(find webroot -iname 'index.html' | head -n 1)
             if [ -n "$FOUND" ]; then
@@ -58,7 +58,7 @@ jobs:
             fi
           fi
 
-          # একদম না পেলে fallback
+          # fallback
           if [ ! -f webroot/index.html ]; then
             echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
           fi
