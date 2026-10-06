@@ -19,12 +19,13 @@ jobs:
         run: |
           brew update
           brew install xcodegen httrack
+          xcodegen --version
 
       # ---------- 2. MIRROR WEBSITE ----------
       - name: Mirror website to local folder
         run: |
           set -e
-          SITE="https://example.com"          # <-- এখানে আপনার সাইটের লিংক বসান
+          SITE="https://playgta5.com"          # <-- এখানে আপনার সাইটের লিংক বসান
           rm -rf webroot
           mkdir -p webroot
 
@@ -78,6 +79,9 @@ jobs:
             bundleIdPrefix: com.example
             deploymentTarget:
               iOS: "14.0"
+            objectVersion: 56
+            xcodeVersion: "15.4"
+            createIntermediateGroups: true
           targets:
             OfflineApp:
               type: application
