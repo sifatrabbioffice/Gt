@@ -1,0 +1,208 @@
+name: Offline Website to Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------- 1. TOOLS ----------
+      - name: Install xcodegen + httrack
+        run: |
+          brew update
+          brew install xcodegen httrack
+
+      # ---------- 2. MIRROR WEBSITE ----------
+      - name: Mirror website to local folder
+        run: |
+          set -e
+          SITE="https://example.com"          # <-- এখানে আপনার সাইটের লিংক বসান
+          rm -rf webroot
+          mkdir -p webroot
+
+          httrack "$SITE" \
+            -O ./webroot \
+            -%v \
+            --robots=0 \
+            --near \
+            --keep-alive \
+            -F "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+            || true
+
+          # httrack সবসময় domain নামে সাব-ফোল্ডার বানায় → ফ্ল্যাট করি
+          DOMAIN_DIR=$(find webroot -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          if [ -n "$DOMAIN_DIR" ]; then
+            shopt -s dotglob
+            mv "$DOMAIN_DIR"/* webroot/ 2>/dev/null || true
+            shopt -u dotglob
+            rmdir "$DOMAIN_DIR" 2>/dev/null || true
+          fi
+
+          # index.html রুটে না থাকলে খুঁজে এনে রুটে আনি
+          if [ ! -f webroot/index.html ]; then
+            FOUND=$(find webroot -iname 'index.html' | head -n 1)
+            if [ -n "$FOUND" ]; then
+              DIR=$(dirname "$FOUND")
+              shopt -s dotglob
+              mv "$DIR"/* webroot/ 2>/dev/null || true
+              shopt -u dotglob
+            fi
+          fi
+
+          # একদম না পেলে fallback
+          if [ ! -f webroot/index.html ]; then
+            echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
+          fi
+
+          echo "----- webroot size -----"
+          du -sh webroot
+          echo "----- top files -----"
+          find webroot -maxdepth 2 | head -60
+
+      # ---------- 3. iOS PROJECT FILES ----------
+      - name: Create Xcode project (XcodeGen) + Swift sources
+        run: |
+          mkdir -p Sources
+
+          cat > project.yml <<'EOF'
+          name: OfflineApp
+          options:
+            bundleIdPrefix: com.example
+            deploymentTarget:
+              iOS: "14.0"
+          targets:
+            OfflineApp:
+              type: application
+              platform: iOS
+              sources:
+                - path: Sources
+                - path: webroot
+                  type: folder
+              info:
+                path: Sources/Info.plist
+                properties:
+                  CFBundleDisplayName: Offline
+                  CFBundleShortVersionString: "1.0"
+                  CFBundleVersion: "1"
+                  UILaunchScreen: {}
+                  UIRequiresFullScreen: false
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.offlineapp
+                  CODE_SIGNING_ALLOWED: "NO"
+                  CODE_SIGNING_REQUIRED: "NO"
+                  CODE_SIGN_IDENTITY: ""
+                  DEVELOPMENT_TEAM: ""
+                  TARGETED_DEVICE_FAMILY: "1,2"
+          EOF
+
+          cat > Sources/AppDelegate.swift <<'EOF'
+          import UIKit
+          import WebKit
+
+          @main
+          class AppDelegate: UIResponder, UIApplicationDelegate {
+              var window: UIWindow?
+
+              func application(_ application: UIApplication,
+                               didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+                  let window = UIWindow(frame: UIScreen.main.bounds)
+                  window.rootViewController = WebViewController()
+                  window.makeKeyAndVisible()
+                  self.window = window
+                  return true
+              }
+          }
+
+          final class WebViewController: UIViewController {
+
+              private var webView: WKWebView!
+
+              override func loadView() {
+                  let config = WKWebViewConfiguration()
+                  config.allowsInlineMediaPlayback = true
+                  config.mediaTypesRequiringUserActionForPlayback = []
+                  let webView = WKWebView(frame: .zero, configuration: config)
+                  webView.allowsBackForwardNavigationGestures = true
+                  self.webView = webView
+                  self.view = webView
+              }
+
+              override func viewDidLoad() {
+                  super.viewDidLoad()
+                  guard let indexURL = Self.findIndexHTML() else {
+                      webView.loadHTMLString("<h1>index.html not found in bundle</h1>", baseURL: nil)
+                      return
+                  }
+                  let root = indexURL.deletingLastPathComponent()
+                  webView.loadFileURL(indexURL, allowingReadAccessTo: root)
+              }
+
+              static func findIndexHTML() -> URL? {
+                  if let u = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "webroot") {
+                      return u
+                  }
+                  if let u = Bundle.main.url(forResource: "index", withExtension: "html") {
+                      return u
+                  }
+                  if let root = Bundle.main.resourceURL,
+                     let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) {
+                      for case let f as URL in en {
+                          if f.lastPathComponent.lowercased() == "index.html" {
+                              return f
+                          }
+                      }
+                  }
+                  return nil
+              }
+          }
+          EOF
+
+      # ---------- 4. BUILD ----------
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned .app
+        run: |
+          xcodebuild \
+            -project OfflineApp.xcodeproj \
+            -scheme OfflineApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      # ---------- 5. PACKAGE UNSIGNED IPA ----------
+      - name: Package unsigned IPA
+        run: |
+          rm -rf Payload OfflineApp.ipa
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/OfflineApp.app Payload/
+          zip -qr OfflineApp.ipa Payload
+          echo "IPA size:"
+          ls -lh OfflineApp.ipa
+
+      # ---------- 6. UPLOAD ----------
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineApp-unsigned-ipa
+          path: OfflineApp.ipa
+          retention-days: 30
+          compression-level: 0
