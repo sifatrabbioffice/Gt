@@ -25,7 +25,7 @@ jobs:
       - name: Mirror website to local folder
         run: |
           set -e
-          SITE="https://playgat5.com"          # <-- আপনার সাইটের লিংক
+          SITE="https://playgat5.com"
           rm -rf webroot
           mkdir -p webroot
 
@@ -38,7 +38,6 @@ jobs:
             -F "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
             || true
 
-          # httrack domain নামে সাব-ফোল্ডার বানায় → ফ্ল্যাট করি
           DOMAIN_DIR=$(find webroot -maxdepth 1 -mindepth 1 -type d | head -n 1)
           if [ -n "$DOMAIN_DIR" ]; then
             shopt -s dotglob
@@ -47,7 +46,6 @@ jobs:
             rmdir "$DOMAIN_DIR" 2>/dev/null || true
           fi
 
-          # index.html খুঁজে রুটে আনি
           if [ ! -f webroot/index.html ]; then
             FOUND=$(find webroot -iname 'index.html' | head -n 1)
             if [ -n "$FOUND" ]; then
@@ -58,14 +56,12 @@ jobs:
             fi
           fi
 
-          # fallback
           if [ ! -f webroot/index.html ]; then
             echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
           fi
 
           echo "----- webroot size -----"
           du -sh webroot
-          echo "----- top files -----"
           find webroot -maxdepth 2 | head -60
 
       # ---------- 3. iOS PROJECT FILES ----------
@@ -174,10 +170,32 @@ jobs:
           }
           EOF
 
-      # ---------- 4. BUILD ----------
-      - name: Generate Xcode project
-        run: xcodegen generate
+      # ---------- 4. GENERATE + FORCE DOWNGRADE FORMAT ----------
+      - name: Generate Xcode project and force objectVersion 56
+        run: |
+          set -e
+          xcodegen generate
 
+          PBX="OfflineApp.xcodeproj/project.pbxproj"
+
+          echo "----- BEFORE -----"
+          grep -m3 -E "objectVersion|compatibilityVersion" "$PBX" || true
+
+          # যেকোনো objectVersion → 56
+          sed -i '' -E 's/objectVersion = [0-9]+;/objectVersion = 56;/g' "$PBX"
+
+          # compatibilityVersion → Xcode 14.0 (Xcode 15.4 সাপোর্ট করে)
+          sed -i '' -E 's/compatibilityVersion = "[^"]*";/compatibilityVersion = "Xcode 14.0";/g' "$PBX"
+
+          echo "----- AFTER -----"
+          grep -m3 -E "objectVersion|compatibilityVersion" "$PBX"
+
+          # safety: objectVersion না থাকলে add করি
+          if ! grep -q "objectVersion = " "$PBX"; then
+            sed -i '' -E '0,/^\{/s//{\n\tobjectVersion = 56;/' "$PBX"
+          fi
+
+      # ---------- 5. BUILD ----------
       - name: Build unsigned .app
         run: |
           xcodebuild \
@@ -192,7 +210,7 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             build
 
-      # ---------- 5. PACKAGE UNSIGNED IPA ----------
+      # ---------- 6. PACKAGE UNSIGNED IPA ----------
       - name: Package unsigned IPA
         run: |
           rm -rf Payload OfflineApp.ipa
@@ -202,7 +220,7 @@ jobs:
           echo "IPA size:"
           ls -lh OfflineApp.ipa
 
-      # ---------- 6. UPLOAD ----------
+      # ---------- 7. UPLOAD ----------
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
