@@ -8,44 +8,114 @@ on:
 jobs:
   build-ipa:
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ---------- 1. TOOLS ----------
-      - name: Install xcodegen + httrack
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install xcodegen
         run: |
           brew update
-          brew install xcodegen httrack
+          brew install xcodegen
           xcodegen --version
 
-      # ---------- 2. MIRROR WEBSITE ----------
-      - name: Mirror website to local folder
+      # ---------- 2. MIRROR WEBSITE (JS-aware) ----------
+      - name: Install scraper
+        run: |
+          npm init -y >/dev/null
+          npm install website-scraper website-scraper-puppeteer puppeteer --silent
+
+      - name: Write scraper script
+        run: |
+          cat > scrape.js <<'EOF'
+          const scrape = require('website-scraper');
+          const PuppeteerPlugin = require('website-scraper-puppeteer');
+
+          (async () => {
+            try {
+              const result = await scrape({
+                urls: ['https://playgat5.com'],
+                directory: './webroot',
+                recursive: true,
+                maxRecursiveDepth: 5,
+                maxDepth: 5,
+                sources: [
+                  { selector: 'img',        attr: 'src' },
+                  { selector: 'img',        attr: 'srcset' },
+                  { selector: 'link',       attr: 'href' },
+                  { selector: 'script',     attr: 'src' },
+                  { selector: 'source',     attr: 'src' },
+                  { selector: 'source',     attr: 'srcset' },
+                  { selector: 'video',      attr: 'src' },
+                  { selector: 'video',      attr: 'poster' },
+                  { selector: 'audio',      attr: 'src' },
+                  { selector: 'a',          attr: 'href' },
+                  { selector: 'iframe',     attr: 'src' },
+                ],
+                request: {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                  },
+                },
+                plugins: [
+                  new PuppeteerPlugin({
+                    launchOptions: {
+                      headless: 'new',
+                      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                    },
+                    scrollToBottom: { timeout: 20000, viewportN: 15 },
+                    blockNavigation: false,
+                  }),
+                ],
+              });
+              console.log('Done. Files:', result.length);
+            } catch (e) {
+              console.error('Scrape failed:', e.message);
+              process.exit(0); // don't kill workflow — fallback applies
+            }
+          })();
+          EOF
+
+      - name: Run scraper
+        run: node scrape.js || true
+
+      - name: Fallback (wget mirror) + flatten
         run: |
           set -e
-          SITE="https://playgat5.com"
-          rm -rf webroot
-          mkdir -p webroot
+          if [ ! -f webroot/index.html ] || [ "$(du -sk webroot | cut -f1)" -lt 100 ]; then
+            echo "Scraper too small or missing index.html — trying wget..."
+            rm -rf webroot
+            mkdir -p webroot
+            wget \
+              --mirror \
+              --page-requisites \
+              --convert-links \
+              --adjust-extension \
+              --no-parent \
+              --no-check-certificate \
+              --user-agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1" \
+              --directory-prefix=webroot \
+              https://playgat5.com/ || true
+          fi
 
-          httrack "$SITE" \
-            -O ./webroot \
-            -%v \
-            --robots=0 \
-            --near \
-            --keep-alive \
-            -F "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
-            || true
-
+          # domain sub-folder flatten
           DOMAIN_DIR=$(find webroot -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          if [ -n "$DOMAIN_DIR" ]; then
+          if [ -n "$DOMAIN_DIR" ] && [ "$DOMAIN_DIR" != "webroot" ]; then
             shopt -s dotglob
             mv "$DOMAIN_DIR"/* webroot/ 2>/dev/null || true
             shopt -u dotglob
             rmdir "$DOMAIN_DIR" 2>/dev/null || true
           fi
 
+          # index.html নিশ্চিত করি
           if [ ! -f webroot/index.html ]; then
             FOUND=$(find webroot -iname 'index.html' | head -n 1)
             if [ -n "$FOUND" ]; then
@@ -55,17 +125,20 @@ jobs:
               shopt -u dotglob
             fi
           fi
-
           if [ ! -f webroot/index.html ]; then
             echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
           fi
 
+          # cleanup logs
+          rm -f webroot/doit.log webroot/hts-log.txt 2>/dev/null || true
+
           echo "----- webroot size -----"
           du -sh webroot
-          find webroot -maxdepth 2 | head -60
+          echo "----- top entries -----"
+          find webroot -maxdepth 2 | head -80
 
       # ---------- 3. iOS PROJECT FILES ----------
-      - name: Create Xcode project (XcodeGen) + Swift sources
+      - name: Create Xcode project + Swift sources
         run: |
           mkdir -p Sources
 
@@ -170,30 +243,16 @@ jobs:
           }
           EOF
 
-      # ---------- 4. GENERATE + FORCE DOWNGRADE FORMAT ----------
+      # ---------- 4. GENERATE + FORCE FORMAT 56 ----------
       - name: Generate Xcode project and force objectVersion 56
         run: |
           set -e
           xcodegen generate
-
           PBX="OfflineApp.xcodeproj/project.pbxproj"
-
-          echo "----- BEFORE -----"
-          grep -m3 -E "objectVersion|compatibilityVersion" "$PBX" || true
-
-          # যেকোনো objectVersion → 56
           sed -i '' -E 's/objectVersion = [0-9]+;/objectVersion = 56;/g' "$PBX"
-
-          # compatibilityVersion → Xcode 14.0 (Xcode 15.4 সাপোর্ট করে)
           sed -i '' -E 's/compatibilityVersion = "[^"]*";/compatibilityVersion = "Xcode 14.0";/g' "$PBX"
-
           echo "----- AFTER -----"
           grep -m3 -E "objectVersion|compatibilityVersion" "$PBX"
-
-          # safety: objectVersion না থাকলে add করি
-          if ! grep -q "objectVersion = " "$PBX"; then
-            sed -i '' -E '0,/^\{/s//{\n\tobjectVersion = 56;/' "$PBX"
-          fi
 
       # ---------- 5. BUILD ----------
       - name: Build unsigned .app
