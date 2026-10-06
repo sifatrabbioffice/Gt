@@ -41,7 +41,7 @@ jobs:
           (async () => {
             try {
               const result = await scrape({
-                urls: ['https://playgta5.com'],
+                urls: ['http://playgta5.com/'],
                 directory: './webroot',
                 recursive: true,
                 maxRecursiveDepth: 5,
