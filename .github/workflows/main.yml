@@ -1,4 +1,4 @@
-name: Offline Website to Unsigned IPA
+name: Offline GTA5 Browser to Unsigned IPA
 
 on:
   workflow_dispatch:
@@ -8,13 +8,12 @@ on:
 jobs:
   build-ipa:
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- 1. TOOLS ----------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -26,96 +25,242 @@ jobs:
           brew install xcodegen
           xcodegen --version
 
-      # ---------- 2. MIRROR WEBSITE (JS-aware) ----------
-      - name: Install scraper
+      # =========================================================
+      # FULL NETWORK CAPTURE (Puppeteer)
+      # =========================================================
+      - name: Install Puppeteer
         run: |
           npm init -y >/dev/null
-          npm install website-scraper website-scraper-puppeteer puppeteer --silent
+          npm install puppeteer --silent
 
-      - name: Write scraper script
+      - name: Write full network capture script
         run: |
-          cat > scrape.js <<'EOF'
-          const scrape = require('website-scraper');
-          const PuppeteerPlugin = require('website-scraper-puppeteer');
+          cat > capture.js <<'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const path = require('path');
+          const { URL } = require('url');
+
+          const ROOT = './webroot';
+          const TARGET = 'https://playgta5.com/';
+          const seen = new Set();
+          let saved = 0;
+          let totalBytes = 0;
+
+          function safePath(urlStr) {
+            try {
+              const u = new URL(urlStr);
+              let p = decodeURIComponent(u.pathname);
+              if (p.endsWith('/') || p === '') p += 'index.html';
+              // querystring → safe suffix
+              if (u.search) {
+                const q = u.search.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60);
+                const ext = path.extname(p);
+                p = p.replace(new RegExp(ext + '$'), q + ext);
+              }
+              // sanitize path traversal
+              p = p.replace(/\.\.+/g, '_').replace(/\/+/g, '/');
+              return path.join(ROOT, u.hostname, p);
+            } catch (e) {
+              return null;
+            }
+          }
 
           (async () => {
+            fs.mkdirSync(ROOT, { recursive: true });
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-web-security',
+                '--enable-features=SharedArrayBuffer',
+                '--js-flags=--max-old-space-size=8192',
+              ],
+            });
+
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 800 });
+            await page.setUserAgent(
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 ' +
+              'Mobile/15E148 Safari/604.1'
+            );
+
+            // ---------- capture every response body ----------
+            page.on('response', async (response) => {
+              try {
+                const url = response.url();
+                if (seen.has(url)) return;
+                const status = response.status();
+                if (status < 200 || status >= 300) return;
+
+                const ct = (response.headers()['content-type'] || '').toLowerCase();
+                // keep everything except streaming/event-stream
+                if (ct.includes('text/event-stream')) return;
+
+                seen.add(url);
+
+                const filePath = safePath(url);
+                if (!filePath) return;
+
+                const buf = await response.buffer().catch(() => null);
+                if (!buf) return;
+
+                fs.mkdirSync(path.dirname(filePath), { recursive: true });
+                fs.writeFileSync(filePath, buf);
+
+                saved++;
+                totalBytes += buf.length;
+
+                if (saved % 25 === 0) {
+                  console.log(`[${saved}] ${(totalBytes / 1048576).toFixed(1)} MB  ${url.slice(0, 90)}`);
+                }
+              } catch (e) {
+                // silent — page may navigate
+              }
+            });
+
+            // ---------- save failed requests too ----------
+            page.on('requestfailed', (req) => {
+              console.log('FAILED:', req.url().slice(0, 120));
+            });
+
+            console.log('Navigating to', TARGET, '...');
             try {
-              const result = await scrape({
-                urls: ['http://playgta5.com/'],
-                directory: './webroot',
-                recursive: true,
-                maxRecursiveDepth: 5,
-                maxDepth: 5,
-                sources: [
-                  { selector: 'img',        attr: 'src' },
-                  { selector: 'img',        attr: 'srcset' },
-                  { selector: 'link',       attr: 'href' },
-                  { selector: 'script',     attr: 'src' },
-                  { selector: 'source',     attr: 'src' },
-                  { selector: 'source',     attr: 'srcset' },
-                  { selector: 'video',      attr: 'src' },
-                  { selector: 'video',      attr: 'poster' },
-                  { selector: 'audio',      attr: 'src' },
-                  { selector: 'a',          attr: 'href' },
-                  { selector: 'iframe',     attr: 'src' },
-                ],
-                request: {
-                  headers: {
-                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                  },
-                },
-                plugins: [
-                  new PuppeteerPlugin({
-                    launchOptions: {
-                      headless: 'new',
-                      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-                    },
-                    scrollToBottom: { timeout: 20000, viewportN: 15 },
-                    blockNavigation: false,
-                  }),
-                ],
+              await page.goto(TARGET, {
+                waitUntil: 'networkidle2',
+                timeout: 120000,
               });
-              console.log('Done. Files:', result.length);
             } catch (e) {
-              console.error('Scrape failed:', e.message);
-              process.exit(0); // don't kill workflow — fallback applies
+              console.log('Initial goto:', e.message);
             }
+
+            // ---------- wait for game engine to load ----------
+            console.log('Waiting for game engine to boot (10 min)...');
+            const deadline = Date.now() + 10 * 60 * 1000;
+            while (Date.now() < deadline) {
+              await new Promise(r => setTimeout(r, 5000));
+
+              // auto-scroll / interact to trigger lazy loads
+              await page.evaluate(() => {
+                window.scrollBy(0, 500);
+                // click canvas / play buttons if present
+                const c = document.querySelector('canvas');
+                if (c) {
+                  const r = c.getBoundingClientRect();
+                  const ev = new MouseEvent('click', {
+                    bubbles: true,
+                    clientX: r.left + r.width / 2,
+                    clientY: r.top + r.height / 2,
+                  });
+                  c.dispatchEvent(ev);
+                }
+              }).catch(() => {});
+
+              const size = (totalBytes / 1048576).toFixed(1);
+              console.log(`[...] ${saved} files, ${size} MB so far`);
+              if (totalBytes > 9 * 1024 * 1024 * 1024) {
+                console.log('Reached 9 GB cap — stopping capture');
+                break;
+              }
+            }
+
+            // ---------- extra pass: fetch() all .wasm / .data refs ----------
+            console.log('Extra pass: fetching asset URLs found in HTML...');
+            const extraUrls = await page.evaluate(() => {
+              const out = new Set();
+              // <script>, <link>, <img>, <source>, <video>, <audio>
+              document.querySelectorAll('[src],[href],[data-src]').forEach(el => {
+                ['src', 'href', 'data-src'].forEach(a => {
+                  const v = el.getAttribute(a);
+                  if (v && (v.endsWith('.wasm') || v.endsWith('.data') ||
+                            v.endsWith('.js') || v.endsWith('.json') ||
+                            v.includes('/assets/') || v.includes('/game/'))) {
+                    try { out.add(new URL(v, location.href).href); } catch (e) {}
+                  }
+                });
+              });
+              // performance entries
+              performance.getEntriesByType('resource').forEach(r => {
+                if (r.name.endsWith('.wasm') || r.name.endsWith('.data')) {
+                  out.add(r.name);
+                }
+              });
+              return [...out];
+            }).catch(() => []);
+
+            for (const u of extraUrls) {
+              if (seen.has(u)) continue;
+              try {
+                const r = await page.evaluate(async (url) => {
+                  const resp = await fetch(url);
+                  const b = await resp.arrayBuffer();
+                  return { ok: resp.ok, len: b.byteLength, data: Array.from(new Uint8Array(b)) };
+                }, u);
+                if (r.ok) {
+                  const fp = safePath(u);
+                  fs.mkdirSync(path.dirname(fp), { recursive: true });
+                  fs.writeFileSync(fp, Buffer.from(r.data));
+                  saved++;
+                  totalBytes += r.len;
+                  seen.add(u);
+                  console.log(`[extra] ${(totalBytes / 1048576).toFixed(1)} MB  ${u.slice(0, 90)}`);
+                }
+              } catch (e) {}
+            }
+
+            // ---------- save final HTML ----------
+            try {
+              const html = await page.content();
+              fs.writeFileSync(path.join(ROOT, 'playgta5.com', 'index.html'), html);
+              console.log('Saved final HTML');
+            } catch (e) {}
+
+            await browser.close();
+
+            console.log('======================================');
+            console.log('DONE:', saved, 'files,', (totalBytes / 1048576).toFixed(1), 'MB');
+            console.log('======================================');
           })();
           EOF
 
-      - name: Run scraper
-        run: node scrape.js || true
+      - name: Run full capture
+        run: node capture.js || true
 
-      - name: Fallback (wget mirror) + flatten
+      # ---------- flatten + verify ----------
+      - name: Flatten webroot and verify index.html
         run: |
           set -e
-          if [ ! -f webroot/index.html ] || [ "$(du -sk webroot | cut -f1)" -lt 100 ]; then
-            echo "Scraper too small or missing index.html — trying wget..."
-            rm -rf webroot
-            mkdir -p webroot
-            wget \
-              --mirror \
-              --page-requisites \
-              --convert-links \
-              --adjust-extension \
-              --no-parent \
-              --no-check-certificate \
-              --user-agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1" \
-              --directory-prefix=webroot \
-              https://playgat5.com/ || true
-          fi
+          echo "----- raw webroot size -----"
+          du -sh webroot || true
+          find webroot -maxdepth 3 | head -80 || true
 
-          # domain sub-folder flatten
-          DOMAIN_DIR=$(find webroot -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          if [ -n "$DOMAIN_DIR" ] && [ "$DOMAIN_DIR" != "webroot" ]; then
+          # find the playgta5.com folder and move contents up
+          if [ -d webroot/playgta5.com ]; then
             shopt -s dotglob
-            mv "$DOMAIN_DIR"/* webroot/ 2>/dev/null || true
+            mv webroot/playgta5.com/* webroot/ 2>/dev/null || true
             shopt -u dotglob
-            rmdir "$DOMAIN_DIR" 2>/dev/null || true
+            rmdir webroot/playgta5.com 2>/dev/null || true
           fi
 
-          # index.html নিশ্চিত করি
+          # any other host folders? flatten them too
+          for d in webroot/*/; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")
+            case "$base" in
+              assets|game|static|js|css|wasm|data|media|img|images|fonts) ;;
+              *)
+                # move contents up only if it doesn't collide
+                shopt -s dotglob
+                mv "$d"* webroot/ 2>/dev/null || true
+                shopt -u dotglob
+                rmdir "$d" 2>/dev/null || true
+                ;;
+            esac
+          done
+
           if [ ! -f webroot/index.html ]; then
             FOUND=$(find webroot -iname 'index.html' | head -n 1)
             if [ -n "$FOUND" ]; then
@@ -125,19 +270,18 @@ jobs:
               shopt -u dotglob
             fi
           fi
+
           if [ ! -f webroot/index.html ]; then
             echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
           fi
 
-          # cleanup logs
-          rm -f webroot/doit.log webroot/hts-log.txt 2>/dev/null || true
-
-          echo "----- webroot size -----"
+          echo "----- final webroot -----"
           du -sh webroot
-          echo "----- top entries -----"
-          find webroot -maxdepth 2 | head -80
+          find webroot -maxdepth 2 | head -100
 
-      # ---------- 3. iOS PROJECT FILES ----------
+      # =========================================================
+      # iOS PROJECT
+      # =========================================================
       - name: Create Xcode project + Swift sources
         run: |
           mkdir -p Sources
@@ -207,6 +351,8 @@ jobs:
                   let config = WKWebViewConfiguration()
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
+                  // allow WebAssembly / large memory
+                  config.preferences.javaScriptEnabled = true
                   let webView = WKWebView(frame: .zero, configuration: config)
                   webView.allowsBackForwardNavigationGestures = true
                   self.webView = webView
@@ -243,8 +389,7 @@ jobs:
           }
           EOF
 
-      # ---------- 4. GENERATE + FORCE FORMAT 56 ----------
-      - name: Generate Xcode project and force objectVersion 56
+      - name: Generate Xcode project + force objectVersion 56
         run: |
           set -e
           xcodegen generate
@@ -254,7 +399,6 @@ jobs:
           echo "----- AFTER -----"
           grep -m3 -E "objectVersion|compatibilityVersion" "$PBX"
 
-      # ---------- 5. BUILD ----------
       - name: Build unsigned .app
         run: |
           xcodebuild \
@@ -269,17 +413,14 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             build
 
-      # ---------- 6. PACKAGE UNSIGNED IPA ----------
       - name: Package unsigned IPA
         run: |
           rm -rf Payload OfflineApp.ipa
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/OfflineApp.app Payload/
           zip -qr OfflineApp.ipa Payload
-          echo "IPA size:"
           ls -lh OfflineApp.ipa
 
-      # ---------- 7. UPLOAD ----------
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
@@ -287,3 +428,11 @@ jobs:
           path: OfflineApp.ipa
           retention-days: 30
           compression-level: 0
+
+      - name: Upload captured webroot (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webroot-captured
+          path: webroot/
+          retention-days: 7
