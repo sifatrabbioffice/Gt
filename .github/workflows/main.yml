@@ -1,9 +1,19 @@
-name: Offline GTA5 Browser to Unsigned IPA
+name: Auto-Run Game and Build Offline IPA
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+    inputs:
+      target_url:
+        description: 'Game URL'
+        required: true
+        default: 'https://playgta5.com/'
+      capture_minutes:
+        description: 'Minutes to auto-play and capture'
+        required: true
+        default: '30'
+
+permissions:
+  contents: write
 
 jobs:
   build-ipa:
@@ -11,11 +21,9 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
@@ -26,14 +34,17 @@ jobs:
           xcodegen --version
 
       # =========================================================
-      # FULL NETWORK CAPTURE (Puppeteer)
+      # AUTO-RUN + FULL NETWORK CAPTURE
       # =========================================================
       - name: Install Puppeteer
         run: |
           npm init -y >/dev/null
           npm install puppeteer --silent
 
-      - name: Write full network capture script
+      - name: Write auto-run capture script
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url || 'https://playgta5.com/' }}
+          CAPTURE_MINUTES: ${{ github.event.inputs.capture_minutes || '30' }}
         run: |
           cat > capture.js <<'EOF'
           const puppeteer = require('puppeteer');
@@ -42,28 +53,31 @@ jobs:
           const { URL } = require('url');
 
           const ROOT = './webroot';
-          const TARGET = 'https://playgta5.com/';
+          const TARGET = process.env.TARGET_URL || 'https://playgta5.com/';
+          const MINUTES = parseInt(process.env.CAPTURE_MINUTES || '30', 10);
           const seen = new Set();
-          let saved = 0;
-          let totalBytes = 0;
+          let saved = 0, totalBytes = 0, failed = 0;
 
           function safePath(urlStr) {
             try {
               const u = new URL(urlStr);
               let p = decodeURIComponent(u.pathname);
-              if (p.endsWith('/') || p === '') p += 'index.html';
-              // querystring → safe suffix
+              if (p === '' || p.endsWith('/')) p += 'index.html';
+              // query → safe suffix
               if (u.search) {
-                const q = u.search.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60);
+                const q = u.search.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 80);
                 const ext = path.extname(p);
-                p = p.replace(new RegExp(ext + '$'), q + ext);
+                p = ext ? p.replace(new RegExp(ext.replace('.', '\\.') + '$'), q + ext)
+                        : p + q;
               }
-              // sanitize path traversal
               p = p.replace(/\.\.+/g, '_').replace(/\/+/g, '/');
               return path.join(ROOT, u.hostname, p);
-            } catch (e) {
-              return null;
-            }
+            } catch { return null; }
+          }
+
+          function fmt(bytes) {
+            if (bytes > 1024*1024*1024) return (bytes/1073741824).toFixed(2)+' GB';
+            return (bytes/1048576).toFixed(1)+' MB';
           }
 
           (async () => {
@@ -72,11 +86,12 @@ jobs:
             const browser = await puppeteer.launch({
               headless: 'new',
               args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
+                '--no-sandbox','--disable-setuid-sandbox',
                 '--disable-web-security',
-                '--enable-features=SharedArrayBuffer',
+                '--enable-features=SharedArrayBuffer,WebAssemblySimd',
                 '--js-flags=--max-old-space-size=8192',
+                '--ignore-certificate-errors',
+                '--autoplay-policy=no-user-gesture-required',
               ],
             });
 
@@ -88,196 +103,216 @@ jobs:
               'Mobile/15E148 Safari/604.1'
             );
 
-            // ---------- capture every response body ----------
-            page.on('response', async (response) => {
+            // ---------- capture every response ----------
+            page.on('response', async (resp) => {
               try {
-                const url = response.url();
+                const url = resp.url();
                 if (seen.has(url)) return;
-                const status = response.status();
-                if (status < 200 || status >= 300) return;
-
-                const ct = (response.headers()['content-type'] || '').toLowerCase();
-                // keep everything except streaming/event-stream
-                if (ct.includes('text/event-stream')) return;
+                const st = resp.status();
+                if (st < 200 || st >= 300) return;
+                const ct = (resp.headers()['content-type'] || '').toLowerCase();
+                if (ct.includes('event-stream')) return;
 
                 seen.add(url);
+                const fp = safePath(url);
+                if (!fp) return;
+                const buf = await resp.buffer().catch(() => null);
+                if (!buf || buf.length === 0) return;
 
-                const filePath = safePath(url);
-                if (!filePath) return;
+                fs.mkdirSync(path.dirname(fp), { recursive: true });
+                fs.writeFileSync(fp, buf);
+                saved++; totalBytes += buf.length;
 
-                const buf = await response.buffer().catch(() => null);
-                if (!buf) return;
-
-                fs.mkdirSync(path.dirname(filePath), { recursive: true });
-                fs.writeFileSync(filePath, buf);
-
-                saved++;
-                totalBytes += buf.length;
-
-                if (saved % 25 === 0) {
-                  console.log(`[${saved}] ${(totalBytes / 1048576).toFixed(1)} MB  ${url.slice(0, 90)}`);
+                if (saved % 10 === 0) {
+                  console.log(`[${saved}] ${fmt(totalBytes)}  ${url.slice(0,110)}`);
                 }
-              } catch (e) {
-                // silent — page may navigate
-              }
+              } catch {}
             });
 
-            // ---------- save failed requests too ----------
             page.on('requestfailed', (req) => {
-              console.log('FAILED:', req.url().slice(0, 120));
+              failed++;
+              if (failed % 20 === 0) console.log(`[FAILED ${failed}]`, req.url().slice(0,110));
             });
 
-            console.log('Navigating to', TARGET, '...');
+            // ---------- open page ----------
+            console.log('Navigating:', TARGET);
             try {
-              await page.goto(TARGET, {
-                waitUntil: 'networkidle2',
-                timeout: 120000,
-              });
-            } catch (e) {
-              console.log('Initial goto:', e.message);
-            }
+              await page.goto(TARGET, { waitUntil: 'networkidle2', timeout: 180000 });
+            } catch (e) { console.log('goto:', e.message); }
 
-            // ---------- wait for game engine to load ----------
-            console.log('Waiting for game engine to boot (10 min)...');
-            const deadline = Date.now() + 10 * 60 * 1000;
-            while (Date.now() < deadline) {
-              await new Promise(r => setTimeout(r, 5000));
-
-              // auto-scroll / interact to trigger lazy loads
-              await page.evaluate(() => {
-                window.scrollBy(0, 500);
-                // click canvas / play buttons if present
-                const c = document.querySelector('canvas');
-                if (c) {
-                  const r = c.getBoundingClientRect();
-                  const ev = new MouseEvent('click', {
-                    bubbles: true,
-                    clientX: r.left + r.width / 2,
-                    clientY: r.top + r.height / 2,
-                  });
-                  c.dispatchEvent(ev);
-                }
-              }).catch(() => {});
-
-              const size = (totalBytes / 1048576).toFixed(1);
-              console.log(`[...] ${saved} files, ${size} MB so far`);
-              if (totalBytes > 9 * 1024 * 1024 * 1024) {
-                console.log('Reached 9 GB cap — stopping capture');
-                break;
-              }
-            }
-
-            // ---------- extra pass: fetch() all .wasm / .data refs ----------
-            console.log('Extra pass: fetching asset URLs found in HTML...');
-            const extraUrls = await page.evaluate(() => {
-              const out = new Set();
-              // <script>, <link>, <img>, <source>, <video>, <audio>
-              document.querySelectorAll('[src],[href],[data-src]').forEach(el => {
-                ['src', 'href', 'data-src'].forEach(a => {
-                  const v = el.getAttribute(a);
-                  if (v && (v.endsWith('.wasm') || v.endsWith('.data') ||
-                            v.endsWith('.js') || v.endsWith('.json') ||
-                            v.includes('/assets/') || v.includes('/game/'))) {
-                    try { out.add(new URL(v, location.href).href); } catch (e) {}
-                  }
-                });
-              });
-              // performance entries
-              performance.getEntriesByType('resource').forEach(r => {
-                if (r.name.endsWith('.wasm') || r.name.endsWith('.data')) {
-                  out.add(r.name);
-                }
-              });
-              return [...out];
-            }).catch(() => []);
-
-            for (const u of extraUrls) {
-              if (seen.has(u)) continue;
+            // ---------- auto-click everything clickable ----------
+            async function autoClickAll() {
               try {
-                const r = await page.evaluate(async (url) => {
-                  const resp = await fetch(url);
-                  const b = await resp.arrayBuffer();
-                  return { ok: resp.ok, len: b.byteLength, data: Array.from(new Uint8Array(b)) };
-                }, u);
-                if (r.ok) {
-                  const fp = safePath(u);
-                  fs.mkdirSync(path.dirname(fp), { recursive: true });
-                  fs.writeFileSync(fp, Buffer.from(r.data));
-                  saved++;
-                  totalBytes += r.len;
-                  seen.add(u);
-                  console.log(`[extra] ${(totalBytes / 1048576).toFixed(1)} MB  ${u.slice(0, 90)}`);
-                }
-              } catch (e) {}
+                const clicked = await page.evaluate(() => {
+                  const sels = [
+                    'button','[role="button"]','a','canvas',
+                    '.play','#play','.start','#start',
+                    '[class*="play"]','[class*="start"]',
+                    '[class*="enter"]','[class*="continue"]',
+                    'input[type="submit"]','input[type="button"]',
+                  ];
+                  let n = 0;
+                  for (const s of sels) {
+                    for (const el of document.querySelectorAll(s)) {
+                      try {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 5 || r.height < 5) continue;
+                        el.click();
+                        // also dispatch pointer events for canvas games
+                        ['mousedown','mouseup','click','touchstart','touchend'].forEach(t => {
+                          try {
+                            const ev = t.startsWith('touch')
+                              ? new TouchEvent(t, { bubbles: true })
+                              : new MouseEvent(t, { bubbles: true,
+                                  clientX: r.left + r.width/2,
+                                  clientY: r.top + r.height/2 });
+                            el.dispatchEvent(ev);
+                          } catch {}
+                        });
+                        n++;
+                      } catch {}
+                    }
+                  }
+                  return n;
+                });
+                if (clicked > 0) console.log(`Auto-clicked ${clicked} elements`);
+              } catch {}
             }
 
-            // ---------- save final HTML ----------
+            // ---------- auto scroll + keypress to trigger lazy loads ----------
+            async function autoInteract() {
+              try {
+                await page.evaluate(() => {
+                  window.scrollBy(0, 1000);
+                  window.dispatchEvent(new Event('resize'));
+                  // dispatch common key events (Space, Enter, ArrowUp)
+                  [32, 13, 38, 40, 37, 39].forEach(code => {
+                    ['keydown','keyup'].forEach(type => {
+                      try {
+                        window.dispatchEvent(new KeyboardEvent(type, {
+                          keyCode: code, which: code, bubbles: true,
+                        }));
+                        document.dispatchEvent(new KeyboardEvent(type, {
+                          keyCode: code, which: code, bubbles: true,
+                        }));
+                      } catch {}
+                    });
+                  });
+                });
+              } catch {}
+            }
+
+            // ---------- periodic capture of performance resources ----------
+            async function harvestPerformanceURLs() {
+              try {
+                return await page.evaluate(() =>
+                  performance.getEntriesByType('resource').map(r => r.name)
+                );
+              } catch { return []; }
+            }
+
+            // ---------- main loop ----------
+            const endTime = Date.now() + MINUTES * 60 * 1000;
+            let tick = 0;
+            let lastHarvestCount = 0;
+
+            while (Date.now() < endTime) {
+              tick++;
+              await autoClickAll();
+              await autoInteract();
+
+              // every 30s, fetch URLs from performance API that we may have missed
+              if (tick % 6 === 0) {
+                const urls = await harvestPerformanceURLs();
+                const newOnes = urls.filter(u => !seen.has(u));
+                if (newOnes.length > 0 && newOnes.length !== lastHarvestCount) {
+                  console.log(`Harvesting ${newOnes.length} missed URLs...`);
+                  lastHarvestCount = newOnes.length;
+                  for (const u of newOnes.slice(0, 200)) {
+                    try {
+                      const r = await page.evaluate(async (url) => {
+                        const resp = await fetch(url, { credentials: 'include' });
+                        if (!resp.ok) return null;
+                        const b = await resp.arrayBuffer();
+                        return Array.from(new Uint8Array(b));
+                      }, u);
+                      if (r) {
+                        const fp = safePath(u);
+                        fs.mkdirSync(path.dirname(fp), { recursive: true });
+                        fs.writeFileSync(fp, Buffer.from(r));
+                        seen.add(u);
+                        saved++; totalBytes += r.length;
+                      }
+                    } catch {}
+                  }
+                }
+              }
+
+              const remain = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
+              console.log(`[${tick}] ${saved} files, ${fmt(totalBytes)}, ${remain}s left`);
+              await new Promise(r => setTimeout(r, 5000));
+            }
+
+            // ---------- final HTML ----------
             try {
               const html = await page.content();
-              fs.writeFileSync(path.join(ROOT, 'playgta5.com', 'index.html'), html);
-              console.log('Saved final HTML');
-            } catch (e) {}
+              const host = new URL(TARGET).hostname;
+              const hp = path.join(ROOT, host, 'index.html');
+              fs.mkdirSync(path.dirname(hp), { recursive: true });
+              fs.writeFileSync(hp, html);
+            } catch {}
 
             await browser.close();
 
-            console.log('======================================');
-            console.log('DONE:', saved, 'files,', (totalBytes / 1048576).toFixed(1), 'MB');
-            console.log('======================================');
+            fs.writeFileSync('capture-stats.json',
+              JSON.stringify({ saved, totalBytes, failed, urls: seen.size }, null, 2));
+
+            console.log('=========================================');
+            console.log('DONE:', saved, 'files,', fmt(totalBytes));
+            console.log('Failed:', failed, '| Unique URLs:', seen.size);
+            console.log('=========================================');
           })();
           EOF
 
-      - name: Run full capture
+      - name: Run auto capture
         run: node capture.js || true
 
-      # ---------- flatten + verify ----------
-      - name: Flatten webroot and verify index.html
+      - name: Show capture stats
+        run: |
+          echo "===== stats ====="
+          cat capture-stats.json || true
+          echo "===== webroot size ====="
+          du -sh webroot || true
+          echo "===== top dirs ====="
+          find webroot -maxdepth 2 -type d | head -40
+
+      # ---------- flatten ----------
+      - name: Flatten webroot
         run: |
           set -e
-          echo "----- raw webroot size -----"
-          du -sh webroot || true
-          find webroot -maxdepth 3 | head -80 || true
-
-          # find the playgta5.com folder and move contents up
-          if [ -d webroot/playgta5.com ]; then
+          HOST=$(echo "${{ github.event.inputs.target_url || 'https://playgta5.com/' }}" | sed -E 's#https?://##; s#/.*##')
+          echo "Host: $HOST"
+          if [ -d "webroot/$HOST" ]; then
             shopt -s dotglob
-            mv webroot/playgta5.com/* webroot/ 2>/dev/null || true
+            mv webroot/$HOST/* webroot/ 2>/dev/null || true
             shopt -u dotglob
-            rmdir webroot/playgta5.com 2>/dev/null || true
+            rmdir webroot/$HOST 2>/dev/null || true
           fi
-
-          # any other host folders? flatten them too
-          for d in webroot/*/; do
-            [ -d "$d" ] || continue
-            base=$(basename "$d")
-            case "$base" in
-              assets|game|static|js|css|wasm|data|media|img|images|fonts) ;;
-              *)
-                # move contents up only if it doesn't collide
-                shopt -s dotglob
-                mv "$d"* webroot/ 2>/dev/null || true
-                shopt -u dotglob
-                rmdir "$d" 2>/dev/null || true
-                ;;
-            esac
-          done
 
           if [ ! -f webroot/index.html ]; then
             FOUND=$(find webroot -iname 'index.html' | head -n 1)
-            if [ -n "$FOUND" ]; then
+            [ -n "$FOUND" ] && {
               DIR=$(dirname "$FOUND")
               shopt -s dotglob
               mv "$DIR"/* webroot/ 2>/dev/null || true
               shopt -u dotglob
-            fi
+            }
           fi
 
-          if [ ! -f webroot/index.html ]; then
-            echo "<html><body><h1>Offline copy (index.html missing)</h1></body></html>" > webroot/index.html
-          fi
-
-          echo "----- final webroot -----"
+          [ ! -f webroot/index.html ] && echo "<html><body><h1>Offline copy</h1></body></html>" > webroot/index.html
+          echo "----- final -----"
           du -sh webroot
-          find webroot -maxdepth 2 | head -100
+          find webroot -maxdepth 2 | head -80
 
       # =========================================================
       # iOS PROJECT
@@ -344,15 +379,15 @@ jobs:
           }
 
           final class WebViewController: UIViewController {
-
               private var webView: WKWebView!
 
               override func loadView() {
                   let config = WKWebViewConfiguration()
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
-                  // allow WebAssembly / large memory
-                  config.preferences.javaScriptEnabled = true
+                  if #available(iOS 14.0, *) {
+                      config.defaultWebpagePreferences.allowsContentJavaScript = true
+                  }
                   let webView = WKWebView(frame: .zero, configuration: config)
                   webView.allowsBackForwardNavigationGestures = true
                   self.webView = webView
@@ -361,27 +396,21 @@ jobs:
 
               override func viewDidLoad() {
                   super.viewDidLoad()
-                  guard let indexURL = Self.findIndexHTML() else {
-                      webView.loadHTMLString("<h1>index.html not found in bundle</h1>", baseURL: nil)
+                  guard let url = Self.findIndexHTML() else {
+                      webView.loadHTMLString("<h1>index.html not found</h1>", baseURL: nil)
                       return
                   }
-                  let root = indexURL.deletingLastPathComponent()
-                  webView.loadFileURL(indexURL, allowingReadAccessTo: root)
+                  webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
               }
 
               static func findIndexHTML() -> URL? {
-                  if let u = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "webroot") {
-                      return u
-                  }
-                  if let u = Bundle.main.url(forResource: "index", withExtension: "html") {
-                      return u
-                  }
+                  if let u = Bundle.main.url(forResource: "index", withExtension: "html",
+                                             subdirectory: "webroot") { return u }
+                  if let u = Bundle.main.url(forResource: "index", withExtension: "html") { return u }
                   if let root = Bundle.main.resourceURL,
                      let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) {
-                      for case let f as URL in en {
-                          if f.lastPathComponent.lowercased() == "index.html" {
-                              return f
-                          }
+                      for case let f as URL in en where f.lastPathComponent.lowercased() == "index.html" {
+                          return f
                       }
                   }
                   return nil
@@ -396,7 +425,6 @@ jobs:
           PBX="OfflineApp.xcodeproj/project.pbxproj"
           sed -i '' -E 's/objectVersion = [0-9]+;/objectVersion = 56;/g' "$PBX"
           sed -i '' -E 's/compatibilityVersion = "[^"]*";/compatibilityVersion = "Xcode 14.0";/g' "$PBX"
-          echo "----- AFTER -----"
           grep -m3 -E "objectVersion|compatibilityVersion" "$PBX"
 
       - name: Build unsigned .app
@@ -421,7 +449,19 @@ jobs:
           zip -qr OfflineApp.ipa Payload
           ls -lh OfflineApp.ipa
 
-      - name: Upload IPA artifact
+      # ---------- upload (chunked to bypass 10GB limit) ----------
+      - name: Split webroot if larger than 8 GB
+        run: |
+          SIZE=$(du -sm webroot | cut -f1)
+          echo "webroot size: ${SIZE} MB"
+          if [ "$SIZE" -gt 8000 ]; then
+            echo "Splitting into 2 GB chunks..."
+            mkdir -p chunks
+            tar -cf - webroot | split -b 2000m - chunks/webroot.part_
+            ls -lh chunks/
+          fi
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: OfflineApp-unsigned-ipa
@@ -429,10 +469,28 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      - name: Upload captured webroot (for debugging)
-        if: always()
+      - name: Upload webroot (small case)
+        if: hashFiles('chunks/*') == ''
         uses: actions/upload-artifact@v4
         with:
           name: webroot-captured
           path: webroot/
+          retention-days: 7
+          compression-level: 6
+
+      - name: Upload webroot chunks (large case)
+        if: hashFiles('chunks/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: webroot-chunks
+          path: chunks/
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload capture stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-stats
+          path: capture-stats.json
           retention-days: 7
